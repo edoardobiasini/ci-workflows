@@ -1,0 +1,215 @@
+name: Deploy to Cloudways (reusable)
+
+# Reusable workflow: the Cloudways build+rsync deploy, shared across projects.
+# Callers reference it as:
+#
+#   jobs:
+#     deploy:
+#       uses: edoardobiasini/ci-workflows/.github/workflows/deploy.yml@v1
+#       with:
+#         environment: ${{ inputs.environment }}   # 'staging' | 'production'
+#       secrets: inherit
+#
+# `secrets: inherit` is required: environment-scoped secrets can't be passed
+# explicitly by a caller job (a job that `uses:` a reusable workflow can't also
+# set `environment:`), so inherit + the `environment:` set on the job below is
+# how CLOUDWAYS_ACCESS_TOKEN / DEPLOY_SSH_KEY and the CW_* vars resolve — all
+# read from the CALLER repo's GitHub Environment. `actions/checkout` here checks
+# out the CALLER's repo (the theme/project), so its bin/remote-post-deploy.sh is
+# present.
+#
+# Configure per GitHub Environment in the CALLER repo (Settings -> Environments
+# -> staging / production), not as plain repo secrets/vars, so staging and
+# production never share credentials.
+#
+# Required environment variables (caller repo):
+#   CW_SSH_HOST    Application's SSH host (IP or hostname)
+#   CW_SSH_USER    The application's own SSH/SFTP user — NOT the server
+#                  master user, see the comment further down
+#   CW_APP_ROOT    Absolute path to the app root on the server,
+#                  e.g. /home/master/applications/<app_id>/public_html
+#   CW_THEME_SLUG  Theme folder name under wp-content/themes/. Defaults to
+#                  sage-starter — set explicitly after bin/rename.sh
+#   CW_SITE_URL    Public hostname for the post-deploy health check
+#   CW_SERVER_ID   Cloudways server ID (for the cache-purge API call)
+#   CW_APP_ID      Cloudways application ID (for the cache-purge API call)
+#
+# Required environment secrets (caller repo):
+#   CLOUDWAYS_ACCESS_TOKEN   Cloudways API Access Token (Platform -> Access
+#                            Tokens), used directly as a Bearer token — NOT
+#                            the legacy account-wide API Key + email/oauth
+#                            exchange, which Cloudways is retiring (EOL
+#                            2026-10-15). No CLOUDWAYS_EMAIL needed for this.
+#   DEPLOY_SSH_KEY           Private key with SSH access to the application
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (staging | production)
+        type: string
+        required: true
+
+env:
+  # Confirmed against Cloudways' actual OpenAPI spec (developers.cloudways.com/api.yaml
+  # -> servers:), not assumed — v1 404s on /app/cache/purge (that route only
+  # exists under v2 now; found via a real failed deploy).
+  CW_API: https://api.cloudways.com/api/v2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      THEME_SLUG: ${{ vars.CW_THEME_SLUG || 'sage-starter' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: composer:v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Build
+        run: |
+          composer install --no-dev --optimize-autoloader --no-interaction
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_HOST: ${{ vars.CW_SSH_HOST }}
+        run: |
+          set -euo pipefail
+          mkdir -p $HOME/.ssh
+          printf '%s\n' "$SSH_KEY" > $HOME/.ssh/id_deploy
+          chmod 600 $HOME/.ssh/id_deploy
+          ssh-keyscan -H "$SSH_HOST" >> $HOME/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync theme + mu-plugin to server
+        env:
+          # This MUST be the Cloudways APPLICATION's own SSH/SFTP user (Access
+          # Details tab on the app), NOT the server's master user. Files
+          # rsynced as master end up owned by master; the app's PHP-FPM pool
+          # runs as the application user and loses read/write on them. This
+          # is the single most common way to break an rsync deploy on
+          # Cloudways.
+          SSH_USER: ${{ vars.CW_SSH_USER }}
+          SSH_HOST: ${{ vars.CW_SSH_HOST }}
+          APP_ROOT: ${{ vars.CW_APP_ROOT }}
+        run: |
+          set -euo pipefail
+          TARGET="$SSH_USER@$SSH_HOST"
+          SSH_OPTS="-i $HOME/.ssh/id_deploy -o BatchMode=yes"
+          RSYNC_SSH="ssh $SSH_OPTS"
+
+          # One timestamped backup dir per run, shared by both rsync calls
+          # below — a one-command rollback
+          # (`rsync -a $BACKUP_DIR/theme/ theme_dir/`) if a build passes CI but
+          # breaks the live site. Cheap insurance; not a full release system.
+          #
+          # Lives INSIDE the webroot (dot-prefixed), not as a sibling of
+          # $APP_ROOT — confirmed via a real failed deploy that Cloudways'
+          # per-application SFTP/SSH user is chrooted/scoped to public_html
+          # only and can't write to applications/<app_id>/ itself
+          # ("mkdir: cannot create directory '.../deploy-backups': Permission
+          # denied"). Not web-exposed in practice (dotfile paths are blocked
+          # by Cloudways' default server config), and outside the rsync
+          # destination paths below so neither --delete call can touch it.
+          BACKUP_ROOT="$APP_ROOT/.deploy-backups/$(date +%Y%m%d-%H%M%S)"
+          ssh $SSH_OPTS "$TARGET" "mkdir -p '$BACKUP_ROOT/theme' '$BACKUP_ROOT/mu-plugin'"
+
+          # Theme: --delete is safe here, this directory is exclusively ours.
+          # storage/ is excluded — runtime-writable (Acorn's compiled view
+          # cache), gitignored so it doesn't exist in this checkout at all,
+          # and must never be pruned by --delete. Dev-only paths excluded too.
+          # packages/ is excluded: it's the local path-repo source for
+          # patterns-digital/sage-support, already mirrored into vendor/ by
+          # `composer install` above, so the runtime never reads packages/.
+          rsync -az --delete \
+            --exclude=.git --exclude=.github --exclude=docs \
+            --exclude=node_modules --exclude=mu-plugin --exclude=storage \
+            --exclude=.claude --exclude=.mcp.json --exclude=bin \
+            --exclude=packages \
+            --exclude=README.md --exclude=CLAUDE.md --exclude=.editorconfig \
+            --backup --backup-dir="$BACKUP_ROOT/theme" \
+            -e "$RSYNC_SSH" \
+            ./ "$TARGET:$APP_ROOT/wp-content/themes/$THEME_SLUG/"
+
+          # mu-plugin: wp-content/mu-plugins/ is a SHARED directory — other
+          # plugins/hosting tooling can and do drop files there. --delete on
+          # the whole directory would prune those too. Scope it to only the
+          # two paths that are exclusively ours: the flat loader file (single
+          # file, no delete semantics needed) and our own uniquely-named
+          # subfolder (delete safely scoped to just that subfolder).
+          #
+          # WordPress doesn't create wp-content/mu-plugins/ by default — a
+          # fresh install has no must-use plugins, so the directory simply
+          # doesn't exist until the first one is added. rsync (both the
+          # single-file copy below and the directory sync after it) needs
+          # the destination's parent to already exist; it won't create a
+          # missing one for a single-file target. Confirmed via a real first
+          # deploy failing with "change_dir ... mu-plugins failed: No such
+          # file or directory". mkdir -p is idempotent, so this is a no-op
+          # on every deploy after the first.
+          ssh $SSH_OPTS "$TARGET" "mkdir -p '$APP_ROOT/wp-content/mu-plugins'"
+
+          rsync -az \
+            -e "$RSYNC_SSH" \
+            "mu-plugin/$THEME_SLUG-core.php" "$TARGET:$APP_ROOT/wp-content/mu-plugins/$THEME_SLUG-core.php"
+
+          rsync -az --delete \
+            --backup --backup-dir="$BACKUP_ROOT/mu-plugin" \
+            -e "$RSYNC_SSH" \
+            "mu-plugin/$THEME_SLUG-core/" "$TARGET:$APP_ROOT/wp-content/mu-plugins/$THEME_SLUG-core/"
+
+      - name: Post-deploy (cache, sanity)
+        id: post_deploy
+        env:
+          SSH_USER: ${{ vars.CW_SSH_USER }}
+          SSH_HOST: ${{ vars.CW_SSH_HOST }}
+          APP_ROOT: ${{ vars.CW_APP_ROOT }}
+        run: |
+          set -euo pipefail
+          ACTIVE_THEME=$(ssh -i $HOME/.ssh/id_deploy -o BatchMode=yes "$SSH_USER@$SSH_HOST" \
+            "APP_ROOT='$APP_ROOT' THEME_SLUG='$THEME_SLUG' bash -s" < bin/remote-post-deploy.sh | tail -1)
+
+          if [ "$ACTIVE_THEME" != "$THEME_SLUG" ]; then
+            echo "::error::Active theme on server is '$ACTIVE_THEME', expected '$THEME_SLUG' — deploy did not activate the right theme (or a prior deploy left it wrong)."
+            exit 1
+          fi
+
+      - name: Purge Cloudways cache
+        env:
+          CW_ACCESS_TOKEN: ${{ secrets.CLOUDWAYS_ACCESS_TOKEN }}
+          SERVER_ID: ${{ vars.CW_SERVER_ID }}
+          APP_ID: ${{ vars.CW_APP_ID }}
+        run: |
+          set -euo pipefail
+          # Access Tokens (Platform -> Access Tokens) are used directly as
+          # the Bearer credential — no oauth/access_token exchange step,
+          # unlike the legacy account-wide API Key + email flow this
+          # replaced (that flow hits Cloudways EOL 2026-10-15).
+          [ -n "$CW_ACCESS_TOKEN" ] || { echo "::error::CLOUDWAYS_ACCESS_TOKEN is empty"; exit 1; }
+          curl -fsS -X POST "$CW_API/app/cache/purge" \
+            -H "Authorization: Bearer $CW_ACCESS_TOKEN" \
+            -d "server_id=$SERVER_ID" -d "app_id=$APP_ID"
+
+      - name: Health check
+        env:
+          SITE_URL: ${{ vars.CW_SITE_URL }}
+        run: |
+          set -euo pipefail
+          # Cache-busting query so we're not just re-reading a warm edge cache
+          # from before the purge above (which can be eventually consistent).
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://$SITE_URL/?_deploy_check=$(date +%s)")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::https://$SITE_URL returned HTTP $STATUS after deploy"
+            exit 1
+          fi
+          echo "==> https://$SITE_URL is up (HTTP 200), active theme confirmed as $THEME_SLUG"
